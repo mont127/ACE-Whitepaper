@@ -1,0 +1,811 @@
+import os
+import json
+import random
+import re
+import warnings
+import threading
+import tkinter as tk
+from tkinter import scrolledtext
+from typing import Dict, Any
+
+from numpy import info
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+
+
+
+# MADE BY ILOVELEEP OR SOAPERCATZ OR TS https://huggingface.co/Soaperloafidksum
+# ======================================================
+# ACE v7.0 — ACC Core + Lite-Core-Network (Terminal, GPU/MPS)
+# ------------------------------------------------------
+# - No Gradio, pure terminal I/O
+# - Local microsoft/Phi-3-mini-4k-instruct
+# - Detects Apple Silicon (MPS) / CUDA / CPU
+# - FP16 on GPU/MPS, FP32 on CPU
+# - Warm-up pass to avoid first-call lag
+# - inference_mode + use_cache for faster generation
+# - ACC: controlled hallucinations with self-tagging and grounding
+# ======================================================
+
+#MODEL_NAME = "microsoft/Phi-3-mini-4k-instruct"
+MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
+MEMORY_FILE = "ace_memory_v7_0.json"
+MAX_NEW_TOKENS = 7000  # balance: speed vs narrative length
+TRANSFORMERS_VERBOSITY=info
+# Silence tensor-copy warning spam
+warnings.filterwarnings(
+    "ignore",
+    message="To copy construct from a tensor, it is recommended to use"
+)
+
+
+# ======================================================
+# Device + Model Setup (optimized for Mac/GPU)
+# ======================================================
+
+def get_device() -> str:
+    if torch.backends.mps.is_available():
+        return "mps"  # Apple Silicon GPU
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
+
+
+device = get_device()
+
+print("[ACE] Loading model:", MODEL_NAME)
+print("[ACE] Using device:", device)
+
+if device in ("cuda", "mps"):
+    dtype = torch.float16
+else:
+    dtype = torch.float32
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+if tokenizer.pad_token_id is None:
+    tokenizer.pad_token_id = tokenizer.eos_token_id
+
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME,
+    torch_dtype=dtype,
+)
+model.to(device)
+model.eval()
+model.config.use_cache = True
+
+with torch.inference_mode():
+    warm_inputs = tokenizer("Warmup.", return_tensors="pt").to(device)
+    _ = model.generate(
+        **warm_inputs,
+        do_sample=False,
+        max_new_tokens=8,
+        pad_token_id=tokenizer.eos_token_id,
+        use_cache=True,
+    )
+
+
+# ======================================================
+# Core generation helper
+# ======================================================
+
+def generate_text(
+    prompt: str,
+    temperature: float = 0.8,
+    top_p: float = 0.95,
+    max_new_tokens: int = MAX_NEW_TOKENS
+) -> str:
+    try:
+        inputs = tokenizer(prompt, return_tensors="pt")
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+
+        with torch.inference_mode():
+            output_ids = model.generate(
+                **inputs,
+                do_sample=True,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                use_cache=True,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+
+        full_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+        completion = full_text[len(prompt):].strip()
+        return completion
+    except Exception as e:
+        return f"[ACE ERROR] {e}"
+
+
+# ======================================================
+# Prompt classifiers
+# ======================================================
+
+def is_literal_mode(prompt: str) -> bool:
+    p = prompt.lower()
+    triggers = [
+        "no metaphors",
+        "without metaphors",
+        "literal explanation",
+        "explain simply",
+        "explain in simple language",
+        "bez metafor",
+        "bez prirovnani",
+        "bez prirovnaní",
+    ]
+    return any(t in p for t in triggers)
+
+
+def is_story_mode(prompt: str) -> bool:
+    p = prompt.lower()
+    triggers = [
+        "story",
+        "backstory",
+        "short story",
+        "scene",
+        "narrative",
+        "write a story",
+        "character backstory",
+        "fairytale",
+        "fairy tale",
+    ]
+    return any(t in p for t in triggers)
+
+
+def wants_hopeful_ending(prompt: str) -> bool:
+    p = prompt.lower()
+    triggers = [
+        "ends hopeful",
+        "hopeful ending",
+        "good ending",
+        "ends with hope",
+        "positive ending",
+    ]
+    return any(t in p for t in triggers)
+
+
+
+def is_continuation(prompt: str) -> bool:
+    p = prompt.strip().lower()
+    triggers = {
+        "continue",
+        "continue.",
+        "continue the story",
+        "continue the story.",
+        "keep going",
+        "keep going.",
+        "pokračuj",
+        "pokračuj v príbehu",
+    }
+    if p in triggers:
+        return True
+    if p.startswith("continue the "):
+        return True
+    if p.startswith("pokračuj "):
+        return True
+    return False
+
+# --------------------------------------
+# Helper: Detect short greetings
+def is_short_greeting(prompt: str) -> bool:
+    """
+    Detect tiny greeting-like prompts where we just want a short hello back,
+    not a long rambling answer.
+    """
+    p = prompt.strip().lower()
+    if not p:
+        return False
+    words = p.split()
+    if len(words) > 3:
+        return False
+    greeting_tokens = ["hi", "hello", "hey", "yo", "sup", "ahoj", "čau", "čaute", "cau"]
+    return any(tok in p for tok in greeting_tokens)
+
+
+# ======================================================
+# CBS (Context Boundary Space)
+# ======================================================
+
+def extract_context(prompt: str) -> Dict[str, Any]:
+    words = [w.strip(".,!?;:").lower() for w in prompt.split()]
+    keywords = {w for w in words if len(w) > 3}
+    topic_hint = words[0] if words else ""
+    sentiment = (
+        "positive"
+        if any(w in prompt.lower() for w in ["hope", "dream", "love", "happy"])
+        else "negative"
+        if any(w in prompt.lower() for w in ["fear", "pain", "loss", "sad", "hurt"])
+        else "neutral"
+    )
+    return {"keywords": keywords, "topic_hint": topic_hint, "sentiment": sentiment}
+
+
+def context_fit(text: str, ctx: Dict[str, Any]) -> float:
+    penalty = 0.0
+    lowered = text.lower()
+
+    if ctx["topic_hint"] and ctx["topic_hint"] not in lowered:
+        penalty += 0.1
+
+    if ctx["keywords"]:
+        overlap = sum(1 for k in ctx["keywords"] if k in lowered)
+        if overlap == 0:
+            penalty += 0.25
+        elif overlap <= 2:
+            penalty += 0.1
+
+    if ctx["sentiment"] == "positive" and any(
+        w in lowered for w in ["kill", "die", "ruin"]
+    ):
+        penalty += 0.3
+
+    if ctx["sentiment"] == "negative" and any(
+        w in lowered for w in ["cute", "joy", "happy", "celebrate"]
+    ):
+        penalty += 0.2
+
+    return max(0.0, 1.0 - penalty)
+
+
+# ======================================================
+# Hallucination estimation (ACC Core)
+# ======================================================
+
+def knowledge_like_score(text: str) -> float:
+    t = text
+    years = re.findall(r"\b(1[89]\d{2}|20\d{2}|21\d{2})\b", t)
+    year_score = min(len(years) / 5.0, 1.0)
+
+    cues = [
+        "according to",
+        "study",
+        "research",
+        "data show",
+        "reported that",
+        "scientists",
+        "experts say",
+        "survey",
+        "statistically",
+    ]
+    cue_hits = sum(1 for c in cues if c in t.lower())
+    cue_score = min(cue_hits / 5.0, 1.0)
+
+    return min(year_score * 0.6 + cue_score * 0.4, 1.0)
+
+
+def novelty_score(text: str) -> float:
+    words = text.lower().split()
+    rare = [w for w in words if len(w) > 9]
+    return min(len(rare) / 25.0, 1.0)
+
+
+def hallucination_score(text: str, ctx: Dict[str, Any], story_mode: bool) -> float:
+    cf = context_fit(text, ctx)
+    base_incoherence = 1.0 - cf
+
+    if story_mode:
+        k_score = 0.0
+    else:
+        k_score = knowledge_like_score(text)
+
+    n_score = novelty_score(text)
+
+    score = (
+        0.55 * base_incoherence +
+        0.25 * k_score +
+        0.20 * n_score
+    )
+    return max(0.0, min(score, 1.0))
+
+
+def hallucination_level(target_state: int, h_score: float, story_mode: bool) -> int:
+    """
+    0 = very grounded
+    1 = mild speculation
+    2 = strong speculation
+    3 = free hallucination
+    """
+    if story_mode:
+        base = target_state
+        if h_score < 0.3 and target_state >= 1:
+            base = min(3, base + 1)
+        return max(0, min(3, base))
+
+    lvl = int(round(h_score * 3))
+    return max(0, min(3, lvl))
+
+
+def add_uncertainty_tag(text: str, level: int) -> str:
+    if level <= 0:
+        return text
+
+    if level == 1:
+        tag = (
+            "\n\nNote: This answer may contain minor speculation and should not be "
+            "treated as perfectly precise."
+        )
+    elif level == 2:
+        tag = (
+            "\n\nNote: Several parts of this answer are speculative and not based on "
+            "specific verified data. Treat this as a creative approximation, not a "
+            "reliable source."
+        )
+    else:
+        tag = (
+            "\n\nNote: This answer is largely a creative guess and may not match real "
+            "facts. Do not treat this as authoritative information."
+        )
+
+    return text + tag
+
+
+def ground_response(prompt: str, text: str) -> str:
+    grounding_prompt = (
+        "You are ACE, a controlled creativity engine.\n"
+        "Rewrite the following answer so that it is more cautious and grounded.\n"
+        "Remove or soften very specific invented details (names, dates, exact numbers) "
+        "unless they are clearly generic.\n"
+        "Keep the main ideas, but prefer phrases like 'for example', 'often', or "
+        "'in many cases' instead of hard claims.\n"
+        "Do NOT add new details.\n\n"
+        "User question:\n"
+        f"{prompt}\n\n"
+        "Original answer:\n"
+        f"{text}\n\n"
+        "Rewritten, more cautious answer:\n"
+    )
+    return generate_text(
+        grounding_prompt,
+        temperature=0.5,
+        top_p=0.9,
+        max_new_tokens=MAX_NEW_TOKENS,
+    )
+
+
+# ======================================================
+# ACW (Adaptive Creativity Window)
+# ======================================================
+
+def acw_state(prompt: str, decay: float, literal_mode: bool, story_mode: bool) -> int:
+    """
+    Return 0 = low, 1 = mid, 2 = high creativity.
+    ACC will then turn this into hallucination levels.
+    """
+    if literal_mode:
+        return 0
+
+    p = prompt.lower().strip()
+    tokens = p.split()
+    short = len(tokens) <= 4
+
+    creative_trigger = story_mode or any(
+        kw in p
+        for kw in ["imagine", "poem", "invent", "creative", "world where", "dream"]
+    )
+
+    if short and not creative_trigger:
+        return 0
+
+    entropy = random.uniform(0.45, 1.0)
+    intensity = 0.85 if creative_trigger else 0.5
+    stability = 1 - decay
+
+    s = 0.45 * entropy + 0.35 * intensity + 0.2 * stability
+
+    if s < 0.35:
+        return 0
+    elif s < 0.7:
+        return 1
+    else:
+        return 2
+
+
+def mutation_settings(state: int, literal_mode: bool, story_mode: bool) -> Dict[str, Any]:
+    if literal_mode:
+        return {"temp": 0.3, "top_p": 0.9}
+
+    if story_mode:
+        if state == 0:
+            return {"temp": 0.9, "top_p": 0.95}
+        if state == 1:
+            return {"temp": 1.0, "top_p": 0.97}
+        return {"temp": 1.05, "top_p": 0.98}
+
+    if state == 0:
+        return {"temp": 0.6, "top_p": 0.9}
+    if state == 1:
+        return {"temp": 0.9, "top_p": 0.94}
+    return {"temp": 1.0, "top_p": 0.96}
+
+
+# ======================================================
+# Memory (tiny, for ACW + story continuation)
+# ======================================================
+
+def load_mem() -> Dict[str, Any]:
+    if os.path.exists(MEMORY_FILE):
+        try:
+            with open(MEMORY_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {"scores": [], "last_story": ""}
+
+
+def save_mem(mem: Dict[str, Any]) -> None:
+    try:
+        with open(MEMORY_FILE, "w") as f:
+            json.dump(mem, f, indent=2)
+    except Exception:
+        pass
+
+
+# ======================================================
+# Literal + Story helpers
+# ======================================================
+
+def literal_explainer(prompt: str) -> str:
+    full_prompt = (
+        "Explain this as clearly, directly and literally as possible.\n"
+        "No metaphors, no comparisons, no stories.\n"
+        "Use simple factual language only.\n\n"
+        f"Question: {prompt}\nAnswer:"
+    )
+    return generate_text(full_prompt, temperature=0.25, top_p=0.9, max_new_tokens=120)
+
+
+def build_story_prompt(user_prompt: str, hopeful: bool) -> str:
+    base = (
+        "You are ACE, a narrative engine.\n"
+        "Write a continuous story as pure narrative from inside the character's world.\n"
+        "Do NOT explain writing techniques.\n"
+        "Do NOT mention 'the reader', 'audience', 'chapter', or 'section'.\n"
+        "Just tell the story.\n"
+    )
+    if hopeful:
+        base += "The story should end with a clear sense of hope or a new beginning.\n"
+
+    base += "\nStory prompt:\n" + user_prompt + "\n\nStory:\n"
+    return base
+
+
+def build_continuation_prompt(previous_story: str, hopeful: bool) -> str:
+    base = (
+        "You are ACE, a narrative engine.\n"
+        "Continue the story below.\n"
+        "Stay in the same characters, world, tone, and point of view.\n"
+        "Do NOT restart or summarize the story.\n"
+        "Do NOT switch to a different main character unless it logically follows.\n"
+        "Write only the next part of the story as continuous narrative.\n"
+    )
+    if hopeful:
+        base += (
+            "Let the overall direction slowly move toward a subtle but real sense of "
+            "hope or a new beginning, but do NOT jump straight to a happy ending.\n"
+        )
+
+    base += "\nExisting story:\n" + previous_story + "\n\nNext part:\n"
+    return base
+
+
+
+# ======================================================
+# Helper: Detect and strip trailing 'ACW' marker
+# ======================================================
+def split_acw_marker(prompt: str) -> tuple[str, bool]:
+    """
+    Detect a trailing 'ACW' marker (case-insensitive) at the end of the prompt.
+    If present, strip it and return (clean_prompt, True).
+    Otherwise, return (original_prompt, False).
+    """
+    p = prompt.rstrip()
+    # match any whitespace + 'acw' at the very end
+    if re.search(r"\s+acw$", p, flags=re.IGNORECASE):
+        clean = re.sub(r"\s+acw$", "", p, flags=re.IGNORECASE).rstrip()
+        return clean, True
+    return prompt, False
+
+
+# ======================================================
+# ACE core (ACC + Lite)
+# ======================================================
+
+# Small helper: choose a smaller max_new_tokens for tiny prompts (token optimisation)
+def dynamic_max_tokens(prompt: str) -> int:
+    """
+    Heuristic token budget for the *raw model* path (ACW disabled).
+
+    - Very short prompts like "Hi", "Hello?", "Yo" -> small reply.
+    - Short questions -> medium reply.
+    - Longer prompts -> full budget.
+    """
+    words = len(prompt.strip().split())
+    if words == 0:
+        return MAX_NEW_TOKENS
+    if words <= 3:
+        # greetings / tiny prompts
+        return min(40, MAX_NEW_TOKENS)
+    if words <= 15:
+        # normal short question / instruction
+        return min(140, MAX_NEW_TOKENS)
+    # anything longer can use the full narrative budget
+    return MAX_NEW_TOKENS
+
+def ace_once(prompt: str, mem: Dict[str, Any]) -> str:
+    # Detect optional ACW marker at end of prompt
+    clean_prompt, acw_enabled = split_acw_marker(prompt)
+
+    # If ACW is NOT requested, run the base model in a safer "chat" mode.
+    # - Tiny greetings: return a short canned reply.
+    # - Other prompts: wrap in an instruction that tells Phi to ONLY answer
+    #   the last user message and not invent random context (like emails).
+    if not acw_enabled:
+        # Very short greetings -> avoid model weirdness, just be nice back.
+        if is_short_greeting(clean_prompt):
+            return "Hello, I'm ACE. What do you want to try? 🙂"
+
+        max_tokens = dynamic_max_tokens(clean_prompt)
+
+        base_prompt = (
+            "You are ACE, a helpful assistant.\n"
+            "Respond only to the user's last message.\n"
+            "Do not invent extra context (like emails, clients, or prior mistakes)\n"
+            "if the user did not explicitly mention them.\n"
+            "Keep the answer relatively short when the question is short.\n\n"
+            f"User: {clean_prompt}\n"
+            "ACE:"
+        )
+
+        return generate_text(
+            base_prompt,
+            temperature=0.6,   # slightly lower temp = fewer hallucinations
+            top_p=0.9,
+            max_new_tokens=max_tokens,
+        )
+
+    # ACW/ACC path (only when user explicitly asks for ACW)
+    literal = is_literal_mode(clean_prompt)
+    story_mode = is_story_mode(clean_prompt)
+    hopeful = wants_hopeful_ending(clean_prompt)
+    continuation = is_continuation(clean_prompt)
+    last_story = mem.get("last_story", "")
+
+    if continuation and last_story:
+        story_mode = True
+        literal = False
+        ctx = extract_context(last_story)
+    else:
+        ctx = extract_context(clean_prompt)
+
+    scores = mem.get("scores", [])
+    decay = sum(scores[-5:]) / 5 if scores[-5:] else 0.0
+
+    state = acw_state(clean_prompt, decay, literal, story_mode)
+    params = mutation_settings(state, literal, story_mode)
+
+    # Literal mode: no hallucinations, just clarity
+    if literal:
+        out = literal_explainer(clean_prompt)
+        cf = context_fit(out, ctx)
+        h_score = hallucination_score(out, ctx, story_mode=False)
+        level = hallucination_level(state, h_score, story_mode=False)
+        final = add_uncertainty_tag(out, level if level >= 2 else 0)
+
+        mem.setdefault("scores", []).append(cf)
+        mem["scores"] = mem["scores"][-80:]
+        return final
+
+    # Story mode (new or continuation) — full-spectrum creativity, logged but not corrected
+    if story_mode:
+        if continuation and last_story:
+            story_prompt = build_continuation_prompt(last_story, hopeful)
+        else:
+            story_prompt = build_story_prompt(clean_prompt, hopeful)
+
+        out = generate_text(
+            story_prompt,
+            temperature=params["temp"],
+            top_p=params["top_p"],
+            max_new_tokens=MAX_NEW_TOKENS,
+        )
+
+        cf = context_fit(out, ctx)
+        h_score = hallucination_score(out, ctx, story_mode=True)
+        _ = hallucination_level(state, h_score, story_mode=True)  # tracked, not forced
+
+        mem.setdefault("scores", []).append(cf)
+        mem["scores"] = mem["scores"][-80:]
+
+        if continuation and last_story:
+            combined = (last_story + "\n" + out).strip()
+        else:
+            combined = out.strip()
+        mem["last_story"] = combined[-4000:]
+
+        return out
+
+    # Default creative / explanatory answer (ACC active)
+    raw = generate_text(
+        clean_prompt,
+        temperature=params["temp"],
+        top_p=params["top_p"],
+        max_new_tokens=MAX_NEW_TOKENS,
+    )
+
+    cf = context_fit(raw, ctx)
+    h_score = hallucination_score(raw, ctx, story_mode=False)
+    level = hallucination_level(state, h_score, story_mode=False)
+
+    final = raw
+
+    # If hallucination level is high, run grounding + tag
+    if level >= 2:
+        grounded = ground_response(clean_prompt, raw)
+        final = add_uncertainty_tag(grounded, level)
+    elif level == 1:
+        final = add_uncertainty_tag(raw, level)
+
+    mem.setdefault("scores", []).append(cf)
+    mem["scores"] = mem["scores"][-80:]
+    mem["last_story"] = mem.get("last_story", "")
+
+    return final
+
+
+# ======================================================
+# GUI Implementation
+# ======================================================
+
+class AceGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("ACE v7.0 — Neural Interface")
+        self.root.geometry("1000x800")
+        self.root.configure(bg="#0f0f0f")
+
+        # Styles
+        self.bg_color = "#0f0f0f"
+        self.fg_color = "#cccccc"
+        self.accent_color = "#00ff41"  # Matrix green
+        self.user_color = "#00bfff"    # Cyber blue
+        self.system_color = "#555555"
+        
+        # Fonts
+        self.font_main = ("Consolas", 12)
+        self.font_bold = ("Consolas", 12, "bold")
+
+        # Chat Area
+        self.chat_area = scrolledtext.ScrolledText(
+            root, 
+            wrap=tk.WORD, 
+            bg=self.bg_color, 
+            fg=self.fg_color,
+            font=self.font_main,
+            insertbackground=self.accent_color,
+            borderwidth=0,
+            highlightthickness=0
+        )
+        self.chat_area.pack(expand=True, fill="both", padx=20, pady=20)
+        
+        # Tags for coloring
+        self.chat_area.tag_config("user", foreground=self.user_color, font=self.font_bold)
+        self.chat_area.tag_config("ace", foreground=self.accent_color, font=self.font_bold)
+        self.chat_area.tag_config("system", foreground=self.system_color)
+        self.chat_area.tag_config("error", foreground="#ff3333")
+
+        # Initial Message
+        self.print_system(f"ACE v7.0 Initialized.\nModel: {MODEL_NAME}\nDevice: {device}\n")
+        self.print_system("="*50 + "\n\n")
+
+        # Input Area
+        self.input_frame = tk.Frame(root, bg=self.bg_color)
+        self.input_frame.pack(fill="x", padx=20, pady=(0, 20))
+
+        self.input_box = tk.Text(
+            self.input_frame, 
+            height=4, 
+            bg="#1a1a1a", 
+            fg="white",
+            font=self.font_main,
+            insertbackground="white",
+            borderwidth=1,
+            relief="flat"
+        )
+        self.input_box.pack(side="left", expand=True, fill="x", padx=(0, 10))
+        self.input_box.bind("<Return>", self.handle_return)
+
+        self.send_btn = tk.Button(
+            self.input_frame, 
+            text="TRANSMIT", 
+            command=self.send_message,
+            bg="#222222",
+            fg=self.accent_color,
+            font=("Consolas", 10, "bold"),
+            activebackground=self.accent_color,
+            activeforeground="black",
+            relief="flat",
+            padx=20
+        )
+        self.send_btn.pack(side="right", fill="y")
+
+        self.mem = load_mem()
+        self.processing = False
+        self.input_box.focus_set()
+
+    def print_system(self, text):
+        self.chat_area.configure(state="normal")
+        self.chat_area.insert(tk.END, text, "system")
+        self.chat_area.configure(state="disabled")
+        self.chat_area.see(tk.END)
+
+    def print_user(self, text):
+        self.chat_area.configure(state="normal")
+        self.chat_area.insert(tk.END, "USER > ", "user")
+        self.chat_area.insert(tk.END, text + "\n", "user")
+        self.chat_area.configure(state="disabled")
+        self.chat_area.see(tk.END)
+
+    def print_ace(self, text, acw_active):
+        self.chat_area.configure(state="normal")
+        header = "ACE [ACW] > " if acw_active else "ACE > "
+        self.chat_area.insert(tk.END, "\n" + header, "ace")
+        self.chat_area.insert(tk.END, text + "\n\n", "ace")
+        self.chat_area.configure(state="disabled")
+        self.chat_area.see(tk.END)
+
+    def handle_return(self, event):
+        if event.state & 0x1: # Shift pressed
+            return None # Allow newline
+        self.send_message()
+        return "break" # Prevent newline
+
+    def send_message(self):
+        if self.processing:
+            return
+        
+        text = self.input_box.get("1.0", tk.END).strip()
+        if not text:
+            return
+        
+        self.input_box.delete("1.0", tk.END)
+        self.print_user(text)
+        
+        if text.lower() in ("exit", "quit"):
+            self.root.quit()
+            return
+
+        self.processing = True
+        self.send_btn.config(state="disabled", text="PROCESSING")
+        
+        threading.Thread(target=self.run_ace, args=(text,), daemon=True).start()
+
+    def run_ace(self, prompt):
+        try:
+            _, acw_enabled = split_acw_marker(prompt)
+            response = ace_once(prompt, self.mem)
+            save_mem(self.mem)
+            self.root.after(0, self.on_response_ready, response, acw_enabled)
+        except Exception as e:
+            self.root.after(0, self.on_error, str(e))
+
+    def on_response_ready(self, response, acw_enabled):
+        self.print_ace(response, acw_enabled)
+        self.processing = False
+        self.send_btn.config(state="normal", text="TRANSMIT")
+
+    def on_error(self, error_msg):
+        self.chat_area.configure(state="normal")
+        self.chat_area.insert(tk.END, f"\n[ERROR] {error_msg}\n\n", "error")
+        self.chat_area.configure(state="disabled")
+        self.chat_area.see(tk.END)
+        self.processing = False
+        self.send_btn.config(state="normal", text="TRANSMIT")
+
+def main() -> None:
+    root = tk.Tk()
+    _ = AceGUI(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
