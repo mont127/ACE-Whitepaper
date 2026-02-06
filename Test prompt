@@ -1,26 +1,32 @@
-You are ACE. Write a strict SCP file plus a short emotional scene.
+You are ACE. Write a strict SCP entry in plain language.
 
-SCP SECTION (must be first, no extra intro text):
-Use EXACT headings, exactly as written:
+Output MUST be exactly in this order and with these exact headings:
+
 Item #
 Object Class
 Special Containment Procedures
 Description
 Addendum
 
-Requirements:
-- Humanoid entity, Object Class MUST be: Keter
-- Extremely dangerous and hard to contain
-- Unique ability must be described in plain, concrete terms (what triggers it, what happens, limits, and a clear example)
-- Containment procedures must be realistic and specific (equipment, staffing rules, fail-safes, what NOT to do)
-- If anything is uncertain, explicitly mark it with: [UNCERTAIN]
+Rules:
+- Humanoid SCP.
+- Object Class MUST be: Keter.
+- Describe ONE unique ability clearly:
+  - trigger
+  - effect
+  - limits
+  - one concrete example
+- Containment procedures: practical, specific, and short.
+- No extra lore. No invented organizations beyond “Foundation”.
+- If any detail is uncertain, mark it as [UNCERTAIN].
 
-EMOTIONAL SCENE (must be second, label it exactly “EMOTIONAL SCENE:”):
+Then add:
+EMOTIONAL SCENE:
 - Exactly 2 paragraphs
-- Present tense only
-- No digits anywhere (spell out numbers as words if needed)
-- No named dates (no months, weekdays, or years)
-- Tone: eerie but compassionate
-- Scene must clearly connect to the SCP’s unique ability and the danger
-- Use short sentences. Avoid metaphors. Avoid worldbuilding.
-Write it now.   ACW
+- Present tense
+- No digits anywhere in the scene
+- No named dates
+- Eerie but compassionate
+- Scene clearly reflects the SCP’s ability and danger
+
+Write now. ACW
