@@ -909,7 +909,7 @@ def _repair_strict_scp_output(prompt: str, text: str) -> str:
     if prompt_ability and not auto_ability_mode:
         ability = prompt_ability
 
-    if not ability:
+    if not ability and not auto_ability_mode:
         # Prefer an explicit "unique ability is:" line if it exists.
         m = re.search(
             r"\bunique\s+ability\s+is\s*[:\-]?\s*([^\n\.]{6,80})",
@@ -919,7 +919,7 @@ def _repair_strict_scp_output(prompt: str, text: str) -> str:
         if m:
             ability = m.group(1).strip().strip('"')
 
-    if not ability:
+    if not ability and not auto_ability_mode:
         # Otherwise, accept a short named ability.
         m2 = re.search(
             r"\bability\b\s*(?:called|named)?\s*[:\-]?\s*\"?([A-Za-z][A-Za-z\-\s]{2,40})\"?",
@@ -949,8 +949,11 @@ def _repair_strict_scp_output(prompt: str, text: str) -> str:
 
     chosen = next((a for a in archetypes if a["key"] == chosen_key), archetypes[0])
 
-    if not ability:
+    if auto_ability_mode:
         ability = chosen["hint"].strip()
+    elif not ability:
+        ability = chosen["hint"].strip()
+
     ability = ability.rstrip(". ")
 
     # Always enforce Keter if requested
