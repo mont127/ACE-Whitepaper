@@ -160,6 +160,8 @@ def generate_text(
 
             gen_ids = output_ids[0][in_len:]
             completion = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+            if not completion:
+                completion = tokenizer.decode(gen_ids, skip_special_tokens=False).strip()
             return completion
 
         # Non-Qwen fallback: old behavior
@@ -181,6 +183,8 @@ def generate_text(
 
         full_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
         completion = full_text[len(prompt):].strip()
+        if not completion:
+            completion = full_text.strip()
         return completion
     except Exception as e:
         return f"[ACE ERROR] {e}"
@@ -810,7 +814,7 @@ def _generate_candidates(
             top_p=top_p,
             max_new_tokens=max_new_tokens,
             system_text=system_text,
-        ).strip()
+        ).lstrip()
 
         if accept_prompt is not None and not _constraint_gate(accept_prompt, out):
             continue
@@ -1081,6 +1085,14 @@ def ace_once(prompt: str, mem: Dict[str, Any]) -> str:
                     max_new_tokens=budget,
                     system_text=DEFAULT_SYSTEM_STORY,
                 )
+                if not out.strip():
+                    out = generate_text(
+                        story_prompt,
+                        temperature=max(0.6, params["temp"] - 0.2),
+                        top_p=max(0.85, params["top_p"] - 0.05),
+                        max_new_tokens=budget,
+                        system_text=DEFAULT_SYSTEM_STORY,
+                    )
 
             # Optionally continue long ONLY for true narrative stories
             if not structured_story:
@@ -1134,6 +1146,14 @@ def ace_once(prompt: str, mem: Dict[str, Any]) -> str:
             max_new_tokens=MAX_NEW_TOKENS,
             system_text=DEFAULT_SYSTEM_ASSISTANT,
         )
+        if not raw.strip():
+            raw = generate_text(
+                gen_prompt,
+                temperature=max(0.6, params["temp"] - 0.2),
+                top_p=max(0.85, params["top_p"] - 0.05),
+                max_new_tokens=min(MAX_NEW_TOKENS, 900),
+                system_text=DEFAULT_SYSTEM_ASSISTANT,
+            )
     else:
         budget = _candidate_budget(state)
         cands = _generate_candidates(
