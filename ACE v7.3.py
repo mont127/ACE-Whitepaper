@@ -17,7 +17,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # MADE BY ILOVELEEP OR SOAPERCATZ OR TS https://huggingface.co/Soaperloafidksum
 # ======================================================
-# ACE v7.2 — ACC Core + Lite-Core-Network (Terminal, GPU/MPS)
+# ACE v7.3 — ACC Core + Lite-Core-Network (Terminal, GPU/MPS)
 # ------------------------------------------------------
 # - No Gradio, pure terminal I/O
 # - Local microsoft/Phi-3-mini-4k-instruct
@@ -1617,7 +1617,7 @@ def ace_once(prompt: str, mem: Dict[str, Any]) -> str:
 class AceGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("ACE v7.2 — Neural Interface")
+        self.root.title("ACE v7.3 — Neural Interface")
         self.root.geometry("1000x800")
         self.root.configure(bg="#0f0f0f")
 
@@ -1652,7 +1652,7 @@ class AceGUI:
         self.chat_area.tag_config("error", foreground="#ff3333")
 
         # Initial Message
-        self.print_system(f"ACE v7.2 Initialized.\nModel: {MODEL_NAME}\nDevice: {device}\n")
+        self.print_system(f"ACE v7.3 Initialized.\nModel: {MODEL_NAME}\nDevice: {device}\n")
         self.print_system("="*50 + "\n\n")
 
         # Input Area
