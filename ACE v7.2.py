@@ -789,21 +789,137 @@ def _repair_strict_scp_output(prompt: str, text: str) -> str:
     p = prompt or ""
     t = (text or "").strip()
 
-    # Extract a rough ability phrase if present (must be plain, non-rambling).
-    # If the model output is messy, fall back to [UNCERTAIN] rather than copying nonsense.
+    def _hash_pick(s: str, n: int) -> int:
+        # Deterministic small hash without importing hashlib
+        h = 0
+        for ch in s:
+            h = (h * 131 + ord(ch)) & 0xFFFFFFFF
+        return h % max(1, n)
+
+    def _extract_prompt_ability(pp: str) -> str:
+        mpa = re.search(r"unique\s+ability\s*\(one\s+sentence\)\s*:\s*(.+)", pp, flags=re.IGNORECASE)
+        if not mpa:
+            return ""
+        a = mpa.group(1).strip()
+        # Treat placeholder as empty
+        if "<your ability here>" in a.lower():
+            return ""
+        # Trim to one sentence
+        a = a.split("\n", 1)[0].strip()
+        a = re.split(r"(?<=[.!?])\s+", a)[0].strip()
+        return a
+
+    prompt_ability = _extract_prompt_ability(p)
+
+    archetypes = [
+        {
+            "key": "auditory",
+            "hint": "Any person who hears the entity speak enters a compulsive obedience state until restrained.",
+            "trigger": "Trigger: A human hears the entity speak at any volume.",
+            "effect": "Effect: The listener follows the most recent imperative they heard and ignores self-preservation.",
+            "limits": "Limits: Ear protection blocks the effect. Audio recordings do not reliably reproduce it. [UNCERTAIN]",
+            "example": "Example: A guard hears a single word through an open door and attempts to unlock the cell while shouting compliance. [UNCERTAIN]",
+            "contain": [
+                "Contain in a sealed humanoid cell with full acoustic dampening.",
+                "All personnel entering the wing must wear active hearing protection.",
+                "Communication with SCP must be text-only via one-way display.",
+                "Do not issue spoken commands within line-of-hearing of SCP.",
+            ],
+            "scene": (
+                "You keep the earmuffs sealed and do not speak. The red light stays on. The intercom is dead. You point to the printed card and wait.\n\n"
+                "A colleague trembles beside you and mouths words you cannot hear. You place a hand on their shoulder and shake your head. You both breathe slowly until the urge to answer fades."
+            ),
+        },
+        {
+            "key": "touch",
+            "hint": "Direct skin contact causes rapid skeletal stiffening in the subject, followed by violent motor spasms.",
+            "trigger": "Trigger: Bare skin contact with the entity or its fresh bodily fluids. [UNCERTAIN]",
+            "effect": "Effect: The subject's muscles lock, then release in uncontrolled bursts that can break bones and equipment.",
+            "limits": "Limits: Protective suits reduce risk. The effect weakens after separation. [UNCERTAIN]",
+            "example": "Example: A technician brushes an ungloved fingertip against a restraint and suffers immediate collapse with repeated convulsions. [UNCERTAIN]",
+            "contain": [
+                "Contain in a sealed humanoid cell with remote-operated restraints.",
+                "No bare-skin exposure is permitted in the containment wing.",
+                "All handling must be performed via robotic manipulators.",
+                "Do not attempt medical intervention without full-body protective suits.",
+            ],
+            "scene": (
+                "You watch the robotic arm tighten the restraints. You keep your gloves on. You check the seals again. You do not rush.\n\n"
+                "Someone nearby wipes tears with a sleeve and asks if you can hold their hand. You cannot. You sit close anyway, and you talk softly through the mask until they stop shaking."
+            ),
+        },
+        {
+            "key": "visual",
+            "hint": "Looking directly at the entity's face causes progressive loss of human recognition and panic-driven violence.",
+            "trigger": "Trigger: Direct line-of-sight confirmation of the entity's face, or a faithful depiction of it. [UNCERTAIN]",
+            "effect": "Effect: The observer's perception of nearby humans destabilizes, leading to panic and violence. [UNCERTAIN]",
+            "limits": "Limits: Non-visual sensors are safe. Brief peripheral exposure reduces severity. [UNCERTAIN]",
+            "example": "Example: A staff member views a reflection and immediately fails to recognize colleagues as human, then attempts to flee the site. [UNCERTAIN]",
+            "contain": [
+                "Contain in a sealed humanoid cell with matte, non-reflective surfaces.",
+                "No mirrors, screens, glass, polished metal, or liquids are permitted in the containment wing.",
+                "Monitoring must be done via non-visual sensors only.",
+                "No personnel may describe the entity's face in speech or writing.",
+                "If a breach is suspected, deploy obscurant foam and evacuate without visual confirmation.",
+            ],
+            "scene": (
+                "You stand outside the door and keep your eyes down. The air feels heavy and still. You repeat the rule in your head and do not imagine the face.\n\n"
+                "A colleague sits beside you and speaks in short sentences. Neither of you looks up. You listen to their breathing and match it with your own until the urge to check the window passes."
+            ),
+        },
+        {
+            "key": "cognitive",
+            "hint": "If a person thinks about the entity for more than a moment, they begin involuntarily writing its thoughts as text.",
+            "trigger": "Trigger: A person focuses on the entity or its name long enough to form a clear mental image. [UNCERTAIN]",
+            "effect": "Effect: The subject begins automatic writing or speech that leaks sensitive information and escalates to self-harm attempts.",
+            "limits": "Limits: Sedation and task redirection reduce onset. Total prevention is [UNCERTAIN].",
+            "example": "Example: A researcher reads the file header and immediately starts typing phrases not present in memory logs until restrained. [UNCERTAIN]",
+            "contain": [
+                "Contain in a sealed humanoid cell with no written signage visible from the corridor.",
+                "All documentation must be stored offline and accessed only in supervised rooms.",
+                "Personnel must rotate frequently to reduce fixation and fatigue.",
+                "Do not repeat the entity's designation aloud in the containment wing.",
+            ],
+            "scene": (
+                "You keep the file closed and look at the floor. You answer only yes or no questions. You avoid saying the designation.\n\n"
+                "Your colleague starts to scribble without noticing. You take the pen away and hold their hands still. You stay with them until their eyes clear and the impulse stops."
+            ),
+        },
+    ]
+
+    def _infer_archetype_from_ability(a: str) -> str:
+        la = (a or "").lower()
+        if any(k in la for k in ["hear", "voice", "sound", "whisper", "spoken", "word"]):
+            return "auditory"
+        if any(k in la for k in ["touch", "skin", "contact", "grip", "hand", "blood", "fluid"]):
+            return "touch"
+        if any(k in la for k in ["see", "look", "gaze", "face", "eye", "visual"]):
+            return "visual"
+        if any(k in la for k in ["think", "memory", "remember", "dream", "idea", "name"]):
+            return "cognitive"
+        return ""
+
+    # Ability source priority:
+    # 1) explicit "Unique ability (one sentence):" from the user's prompt
+    # 2) sanitized extraction from model output
+    # 3) deterministic archetype hint
     ability = ""
 
-    # Prefer an explicit "unique ability is:" line if it exists.
-    m = re.search(
-        r"\bunique\s+ability\s+is\s*[:\-]?\s*([^\n\.]{6,80})",
-        t,
-        flags=re.IGNORECASE,
-    )
-    if m:
-        ability = m.group(1).strip().strip('"')
+    if prompt_ability:
+        ability = prompt_ability
 
-    # Otherwise, accept a short named ability like "Cognitive Cascade" or "Null Recognition".
     if not ability:
+        # Prefer an explicit "unique ability is:" line if it exists.
+        m = re.search(
+            r"\bunique\s+ability\s+is\s*[:\-]?\s*([^\n\.]{6,80})",
+            t,
+            flags=re.IGNORECASE,
+        )
+        if m:
+            ability = m.group(1).strip().strip('"')
+
+    if not ability:
+        # Otherwise, accept a short named ability.
         m2 = re.search(
             r"\bability\b\s*(?:called|named)?\s*[:\-]?\s*\"?([A-Za-z][A-Za-z\-\s]{2,40})\"?",
             t,
@@ -818,10 +934,19 @@ def _repair_strict_scp_output(prompt: str, text: str) -> str:
     if (
         not ability
         or any(b in low_ability for b in bad_fragments)
-        or len(ability.split()) > 10
-        or re.search(r"\b(you|your|we|they|i)\b", low_ability)
+        or len(ability.split()) > 22
     ):
         ability = ""
+
+    # Choose archetype based on the ability text; otherwise deterministic by prompt.
+    chosen_key = _infer_archetype_from_ability(ability)
+    if not chosen_key:
+        chosen_key = archetypes[_hash_pick(p + "|" + t, len(archetypes))]["key"]
+
+    chosen = next((a for a in archetypes if a["key"] == chosen_key), archetypes[0])
+
+    if not ability:
+        ability = chosen["hint"]
 
     # Always enforce Keter if requested
     force_keter = "object class" in p.lower() and "keter" in p.lower()
@@ -846,33 +971,19 @@ def _repair_strict_scp_output(prompt: str, text: str) -> str:
             "SCP is a humanoid entity. Its unique ability is a memetic visual hazard that corrupts face recognition in observers. [UNCERTAIN]"
         )
 
-    # Build Description dynamically from the ability sentence
-    if ability:
-        desc = (
-            ability_line + "\n"
-            "Trigger: Activation occurs when conditions described in the unique ability are met. [UNCERTAIN]\n"
-            "Effect: Subjects experience the direct consequence described in the unique ability, resulting in severe risk to personnel. [UNCERTAIN]\n"
-            "Limits: The effect does not persist beyond the conditions described in the unique ability and does not affect distant observers. [UNCERTAIN]\n"
-            "Example: During containment, personnel exposure consistent with the unique ability resulted in loss of control and emergency evacuation. [UNCERTAIN]"
-        )
-    else:
-        desc = (
-            "SCP is a humanoid entity. Its unique ability is [UNCERTAIN].\n"
-            "Trigger: [UNCERTAIN]\n"
-            "Effect: [UNCERTAIN]\n"
-            "Limits: [UNCERTAIN]\n"
-            "Example: [UNCERTAIN]"
-        )
+    desc = (
+        ability_line + "\n"
+        + chosen["trigger"] + "\n"
+        + chosen["effect"] + "\n"
+        + chosen["limits"] + "\n"
+        + chosen["example"]
+    )
 
     scp = (
         "Item #\n" + item_val + "\n\n"
         "Object Class\n" + obj_class + "\n\n"
         "Special Containment Procedures\n"
-        "Contain in a sealed humanoid cell with matte, non-reflective surfaces.\n"
-        "No mirrors, screens, glass, polished metal, or liquids are permitted in the containment wing.\n"
-        "Monitoring must be done via non-visual sensors only.\n"
-        "No personnel may describe the entity's face in speech or writing.\n"
-        "If a breach is suspected, deploy obscurant foam and evacuate without visual confirmation.\n\n"
+        + "\n".join(chosen["contain"]) + "\n\n"
         "Description\n" + desc + "\n\n"
         "Addendum\n"
         "The entity's intent is [UNCERTAIN]. Termination is not authorized due to exposure risk during close contact. [UNCERTAIN]"
@@ -882,19 +993,7 @@ def _repair_strict_scp_output(prompt: str, text: str) -> str:
         return scp
 
     # Emotional scene: exactly 2 paragraphs, present tense, no digits, no named dates.
-    scene_p1 = (
-        "EMOTIONAL SCENE:\n"
-        "You stand outside the door and keep your eyes down. The air feels heavy and still. "
-        "A warning repeats in your head, and you hold it there like a shield. "
-        "You think of the people inside the facility and choose not to picture their faces."
-    )
-    scene_p2 = (
-        "You sit with a colleague in the corridor and speak in short sentences. "
-        "Neither of you looks up. You listen to their breathing and match it with your own. "
-        "The danger feels close, but the care feels real, and you stay until the shaking eases."
-    )
-
-    scene = scene_p1 + "\n\n" + scene_p2
+    scene = "EMOTIONAL SCENE:\n" + chosen["scene"].strip()
     scene = _strip_digits(scene)
 
     return (scp + "\n\n" + scene).strip()
