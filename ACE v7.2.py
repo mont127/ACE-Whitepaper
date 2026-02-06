@@ -580,10 +580,10 @@ def _constraint_gate(prompt: str, text: str) -> bool:
     # If prompt asks for an emotional scene, require a labeled scene section for reliable gating
     if "emotional scene" in p:
         low = t.lower()
+        # Do NOT require the scene to be present at gating time.
+        # If the scene section exists, validate it; otherwise allow partial candidates.
         if "emotional scene" not in low and "scene" not in low:
-            pass
-        else:
-            return False
+            return True
 
         # Try to isolate the scene part for additional constraints
         scene_part = ""
@@ -665,7 +665,7 @@ def _extra_named_entity_penalty(prompt: str, text: str) -> float:
         return 0.16
     return 0.25
 CANDIDATE_MIN_NEW_TOKENS = 250
-CANDIDATE_MAX_NEW_TOKENS = 500  # hard cap for candidate branch
+CANDIDATE_MAX_NEW_TOKENS = 2500  # hard cap for candidate branch (structured tasks may need more)
 
 
 def _clamp_int(x: int, lo: int, hi: int) -> int:
@@ -673,11 +673,11 @@ def _clamp_int(x: int, lo: int, hi: int) -> int:
 
 
 def _candidate_budget(state: int) -> int:
-    # Keep it short even if MAX_NEW_TOKENS is huge
-    # State 1/2 both short; state only controls count.
-    base = 360
+    # Keep it short even if MAX_NEW_TOKENS is huge.
+    # State controls count; budget stays moderate for speed.
+    base = 520
     if state >= 2:
-        base = 420
+        base = 680
     return _clamp_int(base, CANDIDATE_MIN_NEW_TOKENS, CANDIDATE_MAX_NEW_TOKENS)
 
 
@@ -1057,6 +1057,17 @@ def ace_once(prompt: str, mem: Dict[str, Any]) -> str:
             if cands:
                 best, _ = _pick_best_candidate(cands, ctx, scp_mode, clean_prompt)
                 out = best
+                # If this is a structured SCP/multi-part task and the output looks truncated,
+                # do one short continuation pass to finish required sections.
+                if structured_story and ("addendum" not in out.lower() or "emotional scene" not in out.lower()):
+                    cont = generate_text(
+                        story_prompt + "\n" + out.strip() + "\n",
+                        temperature=params["temp"],
+                        top_p=params["top_p"],
+                        max_new_tokens=300,
+                        system_text=DEFAULT_SYSTEM_STORY,
+                    )
+                    out = (out.rstrip() + "\n" + cont.lstrip()).strip()
             else:
                 # If nothing passed the gate, fall back to a single short constrained generation
                 out = generate_text(
