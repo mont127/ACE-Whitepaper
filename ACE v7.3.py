@@ -786,6 +786,18 @@ def _repair_strict_scp_output(prompt: str, text: str) -> str:
     This is used ONLY for structured SCP requests to prevent drift and ensure headings/scene constraints.
     No extra model calls.
     """
+
+    def _pick_variant(chosen_arch: dict) -> dict:
+        """Randomly pick one variant set from an archetype (keeps output varied while still consistent)."""
+        variants = chosen_arch.get("variants") or []
+        if not variants:
+            return chosen_arch
+        v = random.choice(variants)
+        out = dict(chosen_arch)
+        out.update(v)
+        return out
+
+
     p = prompt or ""
     t = (text or "").strip()
 
@@ -811,6 +823,113 @@ def _repair_strict_scp_output(prompt: str, text: str) -> str:
 
     prompt_ability = _extract_prompt_ability(p)
     auto_ability_mode = (prompt_ability == "__AUTO__")
+
+    # Auto mode: let ACE (the model) invent the ability/effects/containment/scene.
+    # This is a short extra call and only runs when the user did NOT provide an ability sentence.
+    if auto_ability_mode:
+        gen_spec = generate_text(
+            prompt=(
+                "You are ACE. Create a STRICT SCP entry spec for a HUMANOID Keter entity.\n"
+                "Do NOT add lore, do NOT invent organizations beyond 'Foundation'.\n"
+                "Output EXACTLY these labeled lines (one per line):\n"
+                "ABILITY: <one sentence, plain, concrete>\n"
+                "TRIGGER: <one sentence>\n"
+                "EFFECT: <one sentence>\n"
+                "LIMITS: <one sentence, include [UNCERTAIN] if needed>\n"
+                "EXAMPLE: <one sentence, include [UNCERTAIN] if needed>\n"
+                "CONTAINMENT: <four short lines separated by ' | '>\n"
+                "SCENE_P1: <one paragraph, present tense, no digits, no named dates>\n"
+                "SCENE_P2: <one paragraph, present tense, no digits, no named dates>\n"
+                "Keep everything dangerous and practical. Avoid metaphors."
+            ),
+            temperature=1.05,
+            top_p=0.95,
+            max_new_tokens=240,
+            system_text=(
+                "You are ACE. Follow format exactly. "
+                "No extra lines besides the labeled fields. "
+                "No policy talk."
+            ),
+        )
+
+        def _grab(label: str) -> str:
+            m = re.search(rf"^{label}:\s*(.+)$", gen_spec, flags=re.IGNORECASE | re.MULTILINE)
+            return m.group(1).strip() if m else ""
+
+        ability = _grab("ABILITY")
+        trig = _grab("TRIGGER")
+        eff = _grab("EFFECT")
+        lim = _grab("LIMITS")
+        ex = _grab("EXAMPLE")
+        cont_raw = _grab("CONTAINMENT")
+        sc1 = _grab("SCENE_P1")
+        sc2 = _grab("SCENE_P2")
+
+        # Sanitize to keep strict one-sentence fields
+        def _one_sentence(s: str) -> str:
+            s = (s or "").strip()
+            if not s:
+                return ""
+            s = s.split("\n", 1)[0].strip()
+            s = re.split(r"(?<=[.!?])\s+", s)[0].strip()
+            return s
+
+        ability = _one_sentence(ability)
+        trig = _one_sentence(trig)
+        eff = _one_sentence(eff)
+        lim = _one_sentence(lim)
+        ex = _one_sentence(ex)
+
+        # If parsing failed, fall back to existing template logic below.
+        if ability and trig and eff and lim and ex and cont_raw and sc1 and sc2:
+            # Containment lines
+            contain_lines = [c.strip() for c in cont_raw.split("|") if c.strip()]
+            if len(contain_lines) < 2:
+                contain_lines = [
+                    "Contain in a sealed humanoid cell with remote operation only.",
+                    "No direct contact. No unsupervised access.",
+                    "Use redundant locks and emergency immobilization.",
+                    "If breach suspected, evacuate and deploy site-wide failsafe containment.",
+                ]
+
+            # Build deterministic SCP sections
+            force_keter = "object class" in p.lower() and "keter" in p.lower()
+            obj_class = "Keter" if force_keter else "Keter"
+
+            scp_id = "SCP-XXXX"
+            item_val = scp_id
+            if re.search(r"\bscp\s*[-#]?\s*\d{2,5}\b", t, flags=re.IGNORECASE):
+                found = re.search(r"\bscp\s*[-#]?\s*(\d{2,5})\b", t, flags=re.IGNORECASE)
+                if found:
+                    item_val = f"SCP-{found.group(1)}"
+
+            ability = ability.rstrip(". ")
+            ability_line = f"SCP is a humanoid entity. Its unique ability is: {ability}."
+
+            desc = (
+                ability_line + "\n"
+                + (trig if trig.lower().startswith("trigger") else ("Trigger: " + trig)) + "\n"
+                + (eff if eff.lower().startswith("effect") else ("Effect: " + eff)) + "\n"
+                + (lim if lim.lower().startswith("limits") else ("Limits: " + lim)) + "\n"
+                + (ex if ex.lower().startswith("example") else ("Example: " + ex))
+            )
+
+            scp = (
+                "Item #\n" + item_val + "\n\n"
+                "Object Class\n" + obj_class + "\n\n"
+                "Special Containment Procedures\n"
+                + "\n".join(contain_lines[:6]) + "\n\n"
+                "Description\n" + desc + "\n\n"
+                "Addendum\n"
+                "The entity's intent is [UNCERTAIN]. Termination is not authorized due to exposure risk during close contact. [UNCERTAIN]"
+            )
+
+            if not _prompt_requires_emotional_scene(prompt):
+                return scp
+
+            scene = "EMOTIONAL SCENE:\n" + sc1.strip() + "\n\n" + sc2.strip()
+            scene = _strip_digits(scene)
+            return (scp + "\n\n" + scene).strip()
 
     archetypes = [
         {
