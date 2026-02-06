@@ -789,16 +789,39 @@ def _repair_strict_scp_output(prompt: str, text: str) -> str:
     p = prompt or ""
     t = (text or "").strip()
 
-    # Extract a rough ability phrase if present
+    # Extract a rough ability phrase if present (must be plain, non-rambling).
+    # If the model output is messy, fall back to [UNCERTAIN] rather than copying nonsense.
     ability = ""
-    m = re.search(r"\bability\b\s*(?:called|named)?\s*[:\-]?\s*\"?([A-Za-z][A-Za-z\-\s]{2,40})\"?", t, flags=re.IGNORECASE)
+
+    # Prefer an explicit "unique ability is:" line if it exists.
+    m = re.search(
+        r"\bunique\s+ability\s+is\s*[:\-]?\s*([^\n\.]{6,80})",
+        t,
+        flags=re.IGNORECASE,
+    )
     if m:
-        ability = m.group(1).strip()
+        ability = m.group(1).strip().strip('"')
+
+    # Otherwise, accept a short named ability like "Cognitive Cascade" or "Null Recognition".
     if not ability:
-        # Try simpler: first "can" clause
-        m2 = re.search(r"\bcan\b\s+([^.\n]{8,80})", t, flags=re.IGNORECASE)
+        m2 = re.search(
+            r"\bability\b\s*(?:called|named)?\s*[:\-]?\s*\"?([A-Za-z][A-Za-z\-\s]{2,40})\"?",
+            t,
+            flags=re.IGNORECASE,
+        )
         if m2:
             ability = m2.group(1).strip()
+
+    # Sanitize: reject conversational / vague filler.
+    bad_fragments = ["you know", "like", "kinda", "sort of", "whatever", "see your", "i think", "maybe"]
+    low_ability = ability.lower() if ability else ""
+    if (
+        not ability
+        or any(b in low_ability for b in bad_fragments)
+        or len(ability.split()) > 10
+        or re.search(r"\b(you|your|we|they|i)\b", low_ability)
+    ):
+        ability = ""
 
     # Always enforce Keter if requested
     force_keter = "object class" in p.lower() and "keter" in p.lower()
@@ -819,7 +842,9 @@ def _repair_strict_scp_output(prompt: str, text: str) -> str:
     if ability:
         ability_line = f"SCP is a humanoid entity. Its unique ability is: {ability}."
     else:
-        ability_line = "SCP is a humanoid entity. Its unique ability is [UNCERTAIN]."
+        ability_line = (
+            "SCP is a humanoid entity. Its unique ability is a memetic visual hazard that corrupts face recognition in observers. [UNCERTAIN]"
+        )
 
     desc = (
         ability_line + "\n"
