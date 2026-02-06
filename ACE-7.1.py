@@ -499,8 +499,9 @@ DEFAULT_SYSTEM_ASSISTANT = (
 
 DEFAULT_SYSTEM_STORY = (
     "You are ACE, a narrative engine. "
-    "Write an entertaining, coherent, deep emotional story. "
-    "Do not mention policies, safety rules, or meta commentary; stay in-story."
+    "Follow the user's constraints exactly. "
+    "When the user asks for multiple parts, clearly separate them with labels like 'SCP SECTION' and 'EMOTIONAL SCENE'. "
+    "Do not mention policies, safety rules, or meta commentary; stay in-character."
 )
 
 
@@ -545,6 +546,54 @@ def _constraint_gate(prompt: str, text: str) -> bool:
 
     if _is_meta_refusal(t):
         return False
+
+    # SCP heading enforcement when prompt demands specific headings
+    if "scp" in p and "headings" in p:
+        required = [
+            "item #",
+            "object class",
+            "special containment procedures",
+            "description",
+            "addendum",
+        ]
+        low = t.lower()
+        if any(r not in low for r in required):
+            return False
+
+    # If prompt asks for an emotional scene, require a labeled scene section for reliable gating
+    if "emotional scene" in p:
+        low = t.lower()
+        if "emotional scene" not in low and "scene" not in low:
+            return False
+
+        # Try to isolate the scene part for additional constraints
+        scene_part = ""
+        m = re.search(r"(?:emotional\s+scene|scene)\s*[:\-]\s*\n?([\s\S]+)$", t, flags=re.IGNORECASE)
+        if m:
+            scene_part = m.group(1).strip()
+
+        if scene_part:
+            # 2 paragraphs = at least one blank line separating non-empty blocks
+            paras = [pp.strip() for pp in re.split(r"\n\s*\n", scene_part) if pp.strip()]
+            if "2 paragraphs" in p and len(paras) != 2:
+                return False
+
+            # no exact numbers -> forbid digits in the scene portion
+            if "no exact numbers" in p and re.search(r"\d", scene_part):
+                return False
+
+            # no named dates (cheap): forbid month names and weekday names and year-like patterns
+            if "no named dates" in p:
+                months = [
+                    "january","february","march","april","may","june","july","august",
+                    "september","october","november","december",
+                ]
+                days = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"]
+                low_scene = scene_part.lower()
+                if any(mn in low_scene for mn in months) or any(dn in low_scene for dn in days):
+                    return False
+                if re.search(r"\b(1[89]\d{2}|20\d{2}|21\d{2})\b", scene_part):
+                    return False
 
     # Single made-up word name (sports prompt etc.)
     if "single made-up word" in p or "single made up word" in p:
@@ -930,6 +979,12 @@ def ace_once(prompt: str, mem: Dict[str, Any]) -> str:
     decay = sum(scores[-5:]) / 5 if scores[-5:] else 0.0
 
     state = acw_state(clean_prompt, decay, literal, story_mode)
+
+    # ACW is explicitly requested. For story/multi-part creative tasks, avoid state==0 flukes
+    # that can disable the multi-candidate stabilizer.
+    if story_mode and state == 0:
+        state = 1
+
     params = mutation_settings(state, literal, story_mode)
 
     # Literal mode: no hallucinations, just clarity
@@ -945,7 +1000,7 @@ def ace_once(prompt: str, mem: Dict[str, Any]) -> str:
         return final
 
     # Story mode (new or continuation) — full-spectrum creativity, logged but not corrected
-        # Story mode (new or continuation) — multi-candidate ONLY when state>=1, then optionally continue long
+    # Story mode (new or continuation) — multi-candidate ONLY when state>=1, then optionally continue long
     if story_mode:
         if continuation and last_story:
             story_prompt = build_continuation_prompt(last_story, hopeful)
@@ -961,11 +1016,7 @@ def ace_once(prompt: str, mem: Dict[str, Any]) -> str:
                 temperature=params["temp"],
                 top_p=params["top_p"],
                 max_new_tokens=MAX_NEW_TOKENS,
-                system_text=(
-                    "You are ACE, a narrative engine. "
-                    "Write an entertaining, deep, emotional story. "
-                    "Do not mention policies, safety rules, or meta commentary; stay in-story."
-                ),
+                system_text=DEFAULT_SYSTEM_STORY,
             )
         else:
             budget = _candidate_budget(state)
@@ -975,6 +1026,7 @@ def ace_once(prompt: str, mem: Dict[str, Any]) -> str:
                 params=params,
                 max_new_tokens=budget,
                 system_text=DEFAULT_SYSTEM_STORY,
+                accept_prompt=clean_prompt,
             )
             best, _ = _pick_best_candidate(cands, ctx, scp_mode, clean_prompt)
 
@@ -988,11 +1040,7 @@ def ace_once(prompt: str, mem: Dict[str, Any]) -> str:
                     temperature=params["temp"],
                     top_p=params["top_p"],
                     max_new_tokens=remaining,
-                    system_text=(
-                        "You are ACE, a narrative engine. "
-                        "Write an entertaining, deep, emotional story. "
-                        "Do not mention policies, safety rules(unless the user ask about something harmful or illegal), or meta commentary; stay in-story."
-                    ),
+                    system_text=DEFAULT_SYSTEM_STORY,
                 )
                 out = (best.rstrip() + "\n" + cont.lstrip()).strip()
 
@@ -1016,24 +1064,24 @@ def ace_once(prompt: str, mem: Dict[str, Any]) -> str:
     cand_count = 1 if state == 0 else (2 if state == 1 else 3)
 
     if cand_count == 1:
-            raw = generate_text(
-                clean_prompt,
-                temperature=params["temp"],
-                top_p=params["top_p"],
-                max_new_tokens=MAX_NEW_TOKENS,
-                system_text=DEFAULT_SYSTEM_ASSISTANT,
-                )
+        raw = generate_text(
+            clean_prompt,
+            temperature=params["temp"],
+            top_p=params["top_p"],
+            max_new_tokens=MAX_NEW_TOKENS,
+            system_text=DEFAULT_SYSTEM_ASSISTANT,
+        )
     else:
         budget = _candidate_budget(state)
-            cands = _generate_candidates(
+        cands = _generate_candidates(
             gen_prompt=clean_prompt,
             count=cand_count,
             params=params,
             max_new_tokens=budget,
             system_text=DEFAULT_SYSTEM_ASSISTANT,
             accept_prompt=clean_prompt,
-            )
-            raw, _ = _pick_best_candidate(cands, ctx, scp_mode, clean_prompt)
+        )
+        raw, _ = _pick_best_candidate(cands, ctx, scp_mode, clean_prompt)
 
     cf = context_fit(raw, ctx)
     h_score = hallucination_score(raw, ctx, story_mode=False)
