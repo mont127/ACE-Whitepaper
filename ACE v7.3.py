@@ -822,68 +822,83 @@ def _repair_strict_scp_output(prompt: str, text: str) -> str:
         return a
 
     prompt_ability = _extract_prompt_ability(p)
+
+    # Auto mode triggers when the placeholder is used OR when this is a strict SCP request
+    # and the user did not provide an explicit ability sentence.
     auto_ability_mode = (prompt_ability == "__AUTO__")
+    if (not prompt_ability) and _is_strict_scp_request(p):
+        auto_ability_mode = True
 
-    # Auto mode: let ACE (the model) invent the ability/effects/containment/scene.
-    # This is a short extra call and only runs when the user did NOT provide an ability sentence.
     if auto_ability_mode:
-        gen_spec = generate_text(
-            prompt=(
-                "You are ACE. Create a STRICT SCP entry spec for a HUMANOID Keter entity.\n"
-                "Do NOT add lore, do NOT invent organizations beyond 'Foundation'.\n"
-                "Output EXACTLY these labeled lines (one per line):\n"
-                "ABILITY: <one sentence, plain, concrete>\n"
-                "TRIGGER: <one sentence>\n"
-                "EFFECT: <one sentence>\n"
-                "LIMITS: <one sentence, include [UNCERTAIN] if needed>\n"
-                "EXAMPLE: <one sentence, include [UNCERTAIN] if needed>\n"
-                "CONTAINMENT: <four short lines separated by ' | '>\n"
-                "SCENE_P1: <one paragraph, present tense, no digits, no named dates>\n"
-                "SCENE_P2: <one paragraph, present tense, no digits, no named dates>\n"
-                "Keep everything dangerous and practical. Avoid metaphors."
-            ),
-            temperature=1.05,
-            top_p=0.95,
-            max_new_tokens=240,
-            system_text=(
-                "You are ACE. Follow format exactly. "
-                "No extra lines besides the labeled fields. "
-                "No policy talk."
-            ),
-        )
+        # Auto mode: let ACE (the model) invent the ability/effects/containment/scene.
+        # Short extra call; retried a few times for format stability.
+        gen_spec = ""
 
-        def _grab(label: str) -> str:
-            m = re.search(rf"^{label}:\s*(.+)$", gen_spec, flags=re.IGNORECASE | re.MULTILINE)
+        def _grab(label: str, blob: str) -> str:
+            m = re.search(rf"^\s*{label}:\s*(.+)$", blob, flags=re.IGNORECASE | re.MULTILINE)
             return m.group(1).strip() if m else ""
 
-        ability = _grab("ABILITY")
-        trig = _grab("TRIGGER")
-        eff = _grab("EFFECT")
-        lim = _grab("LIMITS")
-        ex = _grab("EXAMPLE")
-        cont_raw = _grab("CONTAINMENT")
-        sc1 = _grab("SCENE_P1")
-        sc2 = _grab("SCENE_P2")
-
-        # Sanitize to keep strict one-sentence fields
         def _one_sentence(s: str) -> str:
             s = (s or "").strip()
             if not s:
                 return ""
             s = s.split("\n", 1)[0].strip()
+            # Keep first sentence only
             s = re.split(r"(?<=[.!?])\s+", s)[0].strip()
             return s
 
-        ability = _one_sentence(ability)
-        trig = _one_sentence(trig)
-        eff = _one_sentence(eff)
-        lim = _one_sentence(lim)
-        ex = _one_sentence(ex)
+        # Try a few times; Qwen sometimes drops labels on the first pass.
+        for _try in range(3):
+            gen_spec = generate_text(
+                prompt=(
+                    "Create a STRICT SCP entry spec for a HUMANOID Keter entity.\n"
+                    "No lore. No invented orgs beyond Foundation.\n"
+                    "Output EXACTLY eight lines, each starting with the label and a single space after the colon.\n"
+                    "Do not output anything else.\n"
+                    "ABILITY: <one sentence, plain, concrete>\n"
+                    "TRIGGER: <one sentence>\n"
+                    "EFFECT: <one sentence>\n"
+                    "LIMITS: <one sentence, include [UNCERTAIN] if needed>\n"
+                    "EXAMPLE: <one sentence, include [UNCERTAIN] if needed>\n"
+                    "CONTAINMENT: <four short clauses separated by ' | '>\n"
+                    "SCENE_P1: <one paragraph, present tense, no digits, no named dates>\n"
+                    "SCENE_P2: <one paragraph, present tense, no digits, no named dates>\n"
+                    "Keep tone eerie but compassionate. Use short sentences. Avoid metaphors."
+                ),
+                temperature=0.85,
+                top_p=0.9,
+                max_new_tokens=380,
+                system_text=(
+                    "You are ACE. Output only the eight labeled lines. "
+                    "No extra lines. No headings. No policy talk."
+                ),
+            )
 
-        # If parsing failed, fall back to existing template logic below.
+            ability = _one_sentence(_grab("ABILITY", gen_spec))
+            trig = _one_sentence(_grab("TRIGGER", gen_spec))
+            eff = _one_sentence(_grab("EFFECT", gen_spec))
+            lim = _one_sentence(_grab("LIMITS", gen_spec))
+            ex = _one_sentence(_grab("EXAMPLE", gen_spec))
+            cont_raw = _grab("CONTAINMENT", gen_spec)
+            sc1 = _grab("SCENE_P1", gen_spec)
+            sc2 = _grab("SCENE_P2", gen_spec)
+
+            if ability and trig and eff and lim and ex and cont_raw and sc1 and sc2:
+                break
+
+        # Build output if we got a full spec; otherwise fall back below.
+        ability = _one_sentence(_grab("ABILITY", gen_spec))
+        trig = _one_sentence(_grab("TRIGGER", gen_spec))
+        eff = _one_sentence(_grab("EFFECT", gen_spec))
+        lim = _one_sentence(_grab("LIMITS", gen_spec))
+        ex = _one_sentence(_grab("EXAMPLE", gen_spec))
+        cont_raw = _grab("CONTAINMENT", gen_spec)
+        sc1 = (_grab("SCENE_P1", gen_spec) or "").strip()
+        sc2 = (_grab("SCENE_P2", gen_spec) or "").strip()
+
         if ability and trig and eff and lim and ex and cont_raw and sc1 and sc2:
             # Containment lines
-            contain_lines = [c.strip() for c in cont_raw.split("|") if c.strip()]
+            contain_lines = [c.strip() for c in re.split(r"\s*\|\s*", cont_raw) if c.strip()]
             if len(contain_lines) < 2:
                 contain_lines = [
                     "Contain in a sealed humanoid cell with remote operation only.",
@@ -892,16 +907,11 @@ def _repair_strict_scp_output(prompt: str, text: str) -> str:
                     "If breach suspected, evacuate and deploy site-wide failsafe containment.",
                 ]
 
-            # Build deterministic SCP sections
-            force_keter = "object class" in p.lower() and "keter" in p.lower()
-            obj_class = "Keter" if force_keter else "Keter"
-
-            scp_id = "SCP-XXXX"
-            item_val = scp_id
-            if re.search(r"\bscp\s*[-#]?\s*\d{2,5}\b", t, flags=re.IGNORECASE):
-                found = re.search(r"\bscp\s*[-#]?\s*(\d{2,5})\b", t, flags=re.IGNORECASE)
-                if found:
-                    item_val = f"SCP-{found.group(1)}"
+            # SCP id: keep numeric id if model output had one; otherwise SCP-XXXX
+            item_val = "SCP-XXXX"
+            found = re.search(r"\bscp\s*[-#]?\s*(\d{2,5})\b", t, flags=re.IGNORECASE)
+            if found:
+                item_val = f"SCP-{found.group(1)}"
 
             ability = ability.rstrip(". ")
             ability_line = f"SCP is a humanoid entity. Its unique ability is: {ability}."
@@ -916,7 +926,7 @@ def _repair_strict_scp_output(prompt: str, text: str) -> str:
 
             scp = (
                 "Item #\n" + item_val + "\n\n"
-                "Object Class\n" + obj_class + "\n\n"
+                "Object Class\nKeter\n\n"
                 "Special Containment Procedures\n"
                 + "\n".join(contain_lines[:6]) + "\n\n"
                 "Description\n" + desc + "\n\n"
