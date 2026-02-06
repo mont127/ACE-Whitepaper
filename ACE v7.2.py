@@ -581,6 +581,8 @@ def _constraint_gate(prompt: str, text: str) -> bool:
     if "emotional scene" in p:
         low = t.lower()
         if "emotional scene" not in low and "scene" not in low:
+            pass
+        else:
             return False
 
         # Try to isolate the scene part for additional constraints
