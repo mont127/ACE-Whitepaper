@@ -424,6 +424,11 @@ def ground_response(prompt: str, text: str) -> str:
         temperature=0.5,
         top_p=0.9,
         max_new_tokens=MAX_NEW_TOKENS,
+        system_text=(
+            "You are ACE, a controlled creativity engine. "
+            "Rewrite to be cautious and grounded. "
+            "Do not add new facts, and do not mention policies or safety rules."
+        ),
     )
 
 
@@ -485,7 +490,112 @@ def mutation_settings(state: int, literal_mode: bool, story_mode: bool) -> Dict[
 # ======================================================
 # ACW Multi-candidate (fast, sequential, no extra model calls)
 # ======================================================
+DEFAULT_SYSTEM_ASSISTANT = (
+    "You are ACE, a helpful assistant. "
+    "Follow the user's constraints precisely. "
+    "No jokes, no filler, no meta commentary. "
+    "Do not mention policies or safety rules unless the user explicitly asks about them."
+)
 
+DEFAULT_SYSTEM_STORY = (
+    "You are ACE, a narrative engine. "
+    "Write an entertaining, coherent, deep emotional story. "
+    "Do not mention policies, safety rules, or meta commentary; stay in-story."
+)
+
+
+def _is_meta_refusal(text: str) -> bool:
+    t = (text or "").lower()
+    if not t:
+        return False
+    bad = [
+        "i'm afraid", "i am afraid", "i can't", "i cannot", "i can not",
+        "i must say", "goes against", "guidelines", "policy", "safety", "ethical",
+        "intended role", "as an ai", "as a language model", "i can't help with that",
+    ]
+    return any(b in t for b in bad)
+
+
+def _extract_forbidden_literals(prompt: str) -> list[str]:
+    p = (prompt or "").lower()
+    out: list[str] = []
+
+    for m in re.finditer(r'(?:never|do not|don\'t)\s+mention\s+"([^"]+)"', p):
+        out.append(m.group(1).strip())
+
+    m2 = re.search(r"(?:never|do not|don't)\s+mention\s+([^\n\r\.\!\?]+)", p)
+    if m2:
+        chunk = m2.group(1).strip()
+        if 0 < len(chunk) <= 24:
+            out.append(chunk)
+
+    if ("never mention" in p or "do not mention" in p or "don't mention" in p) and ("code" in p or "number" in p):
+        nums = re.findall(r"\b\d{3,6}\b", prompt)
+        out.extend(nums)
+
+    return [s for s in {x.strip() for x in out} if s]
+
+
+def _constraint_gate(prompt: str, text: str) -> bool:
+    """Hard reject candidates that miss obvious explicit constraints in the prompt."""
+    p = (prompt or "").lower()
+    t = (text or "").strip()
+    if not t:
+        return False
+
+    if _is_meta_refusal(t):
+        return False
+
+    # Single made-up word name (sports prompt etc.)
+    if "single made-up word" in p or "single made up word" in p:
+        first = next((ln.strip() for ln in t.splitlines() if ln.strip()), "")
+        first_word = re.split(r"\s+", first.replace(":", " ").strip())[0] if first else ""
+        if not first_word:
+            return False
+        if re.search(r"[^a-zA-Z\-]", first_word):
+            return False
+
+    # Rules/equipment/scoring cheap checks
+    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+    bulletish = sum(1 for ln in lines if re.match(r"^(\d+\.|\-|\*)\s+", ln))
+
+    if "5 rules" in p and bulletish < 5:
+        return False
+
+    if ("3 pieces of equipment" in p or "3 equipment" in p) and "equipment" in p and bulletish < 3:
+        return False
+
+    if ("scoring" in p or "score" in p) and not re.search(r"\bpoint\b|\bpoints\b|\bscore\b", t.lower()):
+        return False
+
+    forb = _extract_forbidden_literals(prompt)
+    if forb:
+        low = t.lower()
+        for f in forb:
+            if f and f.lower() in low:
+                return False
+
+    return True
+
+
+def _extra_named_entity_penalty(prompt: str, text: str) -> float:
+    """Penalize introducing lots of new capitalized names not present in the prompt (cheap)."""
+    p = prompt or ""
+    t = text or ""
+
+    cand = set(re.findall(r"\b[A-Z][a-z]{2,}\b", t))
+    base = set(re.findall(r"\b[A-Z][a-z]{2,}\b", p))
+
+    allow = {"The", "A", "An", "And", "But", "If", "In", "On", "At", "As", "After", "Before"}
+    extra = {w for w in cand if w not in base and w not in allow}
+
+    if len(extra) <= 1:
+        return 0.0
+    if len(extra) == 2:
+        return 0.08
+    if len(extra) == 3:
+        return 0.16
+    return 0.25
 CANDIDATE_MIN_NEW_TOKENS = 250
 CANDIDATE_MAX_NEW_TOKENS = 500  # hard cap for candidate branch
 
@@ -580,34 +690,45 @@ def _is_scp_mode(prompt: str) -> bool:
     return ("scp" in p) or ("object class" in p) or ("containment procedures" in p)
 
 
-def _score_candidate(text: str, ctx: Dict[str, Any], scp_mode: bool) -> float:
-    # Use ONLY cheap existing heuristics + simple structure/sentiment
-    cf = context_fit(text, ctx)                       # higher better
-    nv = novelty_score(text)                          # higher better (but keep small weight)
-    es = _sentiment_consistency_score(text, ctx)      # higher better
-    st = _structural_quality_score(text, scp_mode)    # higher better
+def _score_candidate(text: str, ctx: Dict[str, Any], scp_mode: bool, prompt: str) -> float:
+    if _is_meta_refusal(text):
+        return -1.0
 
-    # Weighted sum (tuned for speed + stability)
-    return (0.50 * cf) + (0.15 * nv) + (0.20 * es) + (0.15 * st)
+    cf = context_fit(text, ctx)
+    nv = novelty_score(text)
+    es = _sentiment_consistency_score(text, ctx)
+    st = _structural_quality_score(text, scp_mode)
 
+    gate_pen = 0.35 if not _constraint_gate(prompt, text) else 0.0
+    ne_pen = _extra_named_entity_penalty(prompt, text)
+
+    score = (0.54 * cf) + (0.12 * nv) + (0.20 * es) + (0.14 * st)
+    return score - gate_pen - ne_pen
 
 def _generate_candidates(
     gen_prompt: str,
     count: int,
     params: Dict[str, Any],
     max_new_tokens: int,
+    system_text: str | None = None,
+    accept_prompt: str | None = None,
 ) -> list[str]:
-    # Sequential generation only (MPS-safe, no parallel calls)
+    """Sequential generation only. If accept_prompt is provided, enforce _constraint_gate."""
     outs: list[str] = []
-    for i in range(count):
-        # tiny jitter helps diversity without turning it into chaos
+    attempts = 0
+    max_attempts = max(6, count * 3)
+
+    while len(outs) < count and attempts < max_attempts:
+        i = len(outs)
+        attempts += 1
+
         temp = float(params["temp"])
         top_p = float(params["top_p"])
 
         if i == 1:
             temp = min(1.25, temp + 0.05)
             top_p = min(0.99, top_p + 0.01)
-        elif i == 2:
+        elif i >= 2:
             temp = min(1.30, temp + 0.08)
             top_p = min(0.99, top_p + 0.015)
 
@@ -616,8 +737,14 @@ def _generate_candidates(
             temperature=temp,
             top_p=top_p,
             max_new_tokens=max_new_tokens,
-        )
-        outs.append(out.strip())
+            system_text=system_text,
+        ).strip()
+
+        if accept_prompt is not None and not _constraint_gate(accept_prompt, out):
+            continue
+
+        outs.append(out)
+
     return outs
 
 
@@ -625,11 +752,12 @@ def _pick_best_candidate(
     candidates: list[str],
     ctx: Dict[str, Any],
     scp_mode: bool,
+    prompt: str,
 ) -> tuple[str, float]:
     best_text = candidates[0] if candidates else ""
-    best_score = -1.0
+    best_score = -999.0
     for c in candidates:
-        s = _score_candidate(c, ctx, scp_mode)
+        s = _score_candidate(c, ctx, scp_mode, prompt)
         if s > best_score:
             best_score = s
             best_text = c
@@ -758,7 +886,7 @@ def ace_once(prompt: str, mem: Dict[str, Any]) -> str:
     if not acw_enabled:
         # Very short greetings -> avoid model weirdness, just be nice back.
         if is_short_greeting(clean_prompt):
-            return "Hello, I'm ACE. What do you want to try? 🙂"
+            return "Hello, I'm ACE. What do you want to try?"
 
         max_tokens = dynamic_max_tokens(clean_prompt)
 
@@ -846,8 +974,9 @@ def ace_once(prompt: str, mem: Dict[str, Any]) -> str:
                 count=cand_count,
                 params=params,
                 max_new_tokens=budget,
+                system_text=DEFAULT_SYSTEM_STORY,
             )
-            best, _ = _pick_best_candidate(cands, ctx, scp_mode)
+            best, _ = _pick_best_candidate(cands, ctx, scp_mode, clean_prompt)
 
             # Optionally continue to long budget for stories
             out = best
@@ -887,21 +1016,24 @@ def ace_once(prompt: str, mem: Dict[str, Any]) -> str:
     cand_count = 1 if state == 0 else (2 if state == 1 else 3)
 
     if cand_count == 1:
-        raw = generate_text(
-            clean_prompt,
-            temperature=params["temp"],
-            top_p=params["top_p"],
-            max_new_tokens=MAX_NEW_TOKENS,
-        )
+            raw = generate_text(
+                clean_prompt,
+                temperature=params["temp"],
+                top_p=params["top_p"],
+                max_new_tokens=MAX_NEW_TOKENS,
+                system_text=DEFAULT_SYSTEM_ASSISTANT,
+                )
     else:
         budget = _candidate_budget(state)
-        cands = _generate_candidates(
+            cands = _generate_candidates(
             gen_prompt=clean_prompt,
             count=cand_count,
             params=params,
             max_new_tokens=budget,
-        )
-        raw, _ = _pick_best_candidate(cands, ctx, scp_mode)
+            system_text=DEFAULT_SYSTEM_ASSISTANT,
+            accept_prompt=clean_prompt,
+            )
+            raw, _ = _pick_best_candidate(cands, ctx, scp_mode, clean_prompt)
 
     cf = context_fit(raw, ctx)
     h_score = hallucination_score(raw, ctx, story_mode=False)
