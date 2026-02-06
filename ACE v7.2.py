@@ -846,23 +846,23 @@ def _repair_strict_scp_output(prompt: str, text: str) -> str:
             "SCP is a humanoid entity. Its unique ability is a memetic visual hazard that corrupts face recognition in observers. [UNCERTAIN]"
         )
 
-# Build Description dynamically from the ability sentence
-if ability:
-    desc = (
-        ability_line + "\n"
-        "Trigger: Activation occurs when conditions described in the unique ability are met. [UNCERTAIN]\n"
-        "Effect: Subjects experience the direct consequence described in the unique ability, resulting in severe risk to personnel. [UNCERTAIN]\n"
-        "Limits: The effect does not persist beyond the conditions described in the unique ability and does not affect distant observers. [UNCERTAIN]\n"
-        "Example: During containment, personnel exposure consistent with the unique ability resulted in loss of control and emergency evacuation. [UNCERTAIN]"
-    )
-else:
-    desc = (
-        "SCP is a humanoid entity. Its unique ability is [UNCERTAIN].\n"
-        "Trigger: [UNCERTAIN]\n"
-        "Effect: [UNCERTAIN]\n"
-        "Limits: [UNCERTAIN]\n"
-        "Example: [UNCERTAIN]"
-    )
+    # Build Description dynamically from the ability sentence
+    if ability:
+        desc = (
+            ability_line + "\n"
+            "Trigger: Activation occurs when conditions described in the unique ability are met. [UNCERTAIN]\n"
+            "Effect: Subjects experience the direct consequence described in the unique ability, resulting in severe risk to personnel. [UNCERTAIN]\n"
+            "Limits: The effect does not persist beyond the conditions described in the unique ability and does not affect distant observers. [UNCERTAIN]\n"
+            "Example: During containment, personnel exposure consistent with the unique ability resulted in loss of control and emergency evacuation. [UNCERTAIN]"
+        )
+    else:
+        desc = (
+            "SCP is a humanoid entity. Its unique ability is [UNCERTAIN].\n"
+            "Trigger: [UNCERTAIN]\n"
+            "Effect: [UNCERTAIN]\n"
+            "Limits: [UNCERTAIN]\n"
+            "Example: [UNCERTAIN]"
+        )
 
     scp = (
         "Item #\n" + item_val + "\n\n"
