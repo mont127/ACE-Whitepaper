@@ -150,9 +150,11 @@ def generate_text(
                     **inputs,
                     do_sample=True,
                     max_new_tokens=max_new_tokens,
+                    min_new_tokens=8,
                     temperature=temperature,
                     top_p=top_p,
                     use_cache=True,
+                    eos_token_id=tokenizer.eos_token_id,
                     pad_token_id=tokenizer.pad_token_id,
                 )
 
@@ -169,9 +171,11 @@ def generate_text(
                 **inputs,
                 do_sample=True,
                 max_new_tokens=max_new_tokens,
+                min_new_tokens=8,
                 temperature=temperature,
                 top_p=top_p,
                 use_cache=True,
+                eos_token_id=tokenizer.eos_token_id,
                 pad_token_id=tokenizer.pad_token_id,
             )
 
@@ -976,7 +980,7 @@ def ace_once(prompt: str, mem: Dict[str, Any]) -> str:
             system_text=(
                 "You are ACE, a helpful assistant. "
                 "Follow the user's instructions. "
-                "Do not mention policies, safety rules, or refusals unless the user explicitly asks about them. Or asks about something illegal or harmful. "
+                "Do not mention policies, safety rules, or refusals unless the user explicitly asks about them."
             ),
         )
 
