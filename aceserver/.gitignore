@@ -1,8 +1,0 @@
-.venv/
-__pycache__/
-*.pyc
-*.log
-ace_memory_*.json
-.DS_Store
-.env
-.cache/
